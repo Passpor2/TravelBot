@@ -1,46 +1,31 @@
-import telebot
-import datetime
-import handlers
+import asyncio
+import telebot.types as tt
 
-from loader import bot, UserRequest
+from loader import bot, user_contexts
+from handlers import UserContext, StartState
 
 
 @bot.message_handler(content_types=["text"])
-def get_msg(message: telebot.types.Message) -> None:
-    text = message.text
-
-    if text.lower() in ("/hello-world", "привет", "/help", "help"):
-        response = "Привет. " \
-                   "\nЭтот телеграмм-бот поможет найти подходящие отели в любом городе мира." \
-                   "\n\nКоманды бота:" \
-                   "\n/lowprice: самые дешёвые отели в выбранном городе" \
-                   "\n/highprice: самые дорогие отели" \
-                   "\n/bestdeal: отели в заданном ценовом диапазоне, " \
-                   "находящиеся от центра города не далее заданного расстояния" \
-                   "\n/history: история запросов"
-        bot.send_message(message.from_user.id, response)
-
-    elif text in ("/lowprice", "/highprice"):
-        today = datetime.datetime.now()
-        check_in = (today + datetime.timedelta(1)).date()
-        check_out = (today + datetime.timedelta(2)).date()
-        user_request = UserRequest(user_id=message.from_user.id,
-                                   command=text,
-                                   request_dt=datetime.datetime.now(),
-                                   check_in=check_in,
-                                   check_out=check_out)
-        user_request.save()
-        bot.send_message(message.from_user.id, "Введите город: ")
-        bot.register_next_step_handler(message,
-                                       handlers.get_city,
-                                       user_request.get_id())
-
+async def get_msg(message: tt.Message) -> None:
+    user_id = message.from_user.id
+    if user_id not in user_contexts:
+        cur_user_context = UserContext(user_id, StartState())
+        user_contexts[user_id] = cur_user_context
     else:
-        bot.send_message(message.from_user.id,
-                         'Извините, но такую команду бот не поддерживает. '
-                         'Воспользуйтесь командой /help или введите '
-                         '"Привет" для получения информации о боте.')
+        cur_user_context = user_contexts.get(user_id)
+    await cur_user_context.text_request(message)
 
 
-if __name__ == '__main__':
-    bot.polling(none_stop=True, interval=0, timeout=50)
+@bot.callback_query_handler(func=lambda call: True)
+async def get_call(call: tt.CallbackQuery) -> None:
+    user_id = call.from_user.id
+    if user_id not in user_contexts:
+        cur_user_context = UserContext(user_id, StartState())
+        user_contexts[user_id] = cur_user_context
+    else:
+        cur_user_context = user_contexts.get(user_id)
+    await cur_user_context.callback_request(call)
+
+
+if __name__ == "__main__":
+    asyncio.run(bot.polling(none_stop=True, interval=0, timeout=50))

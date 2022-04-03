@@ -1,94 +1,176 @@
-import peewee
-import telebot
+from __future__ import annotations
 
-from loader import bot, UserRequest
+import telebot.types as tt
+import datetime
+
 from api_requests import get_destination_id, get_hotels_info
-from peewee import Model
+from loader import bot, db, UserRequest
+from abc import ABC, abstractmethod
+from typing import Union
 
 
-def get_city(message: telebot.types.Message, request_id: str) -> None:
-    user_request = UserRequest.get_by_id(request_id)
-    city = message.text
-    user_request.city = city
-    user_request.save()
+class UserContext:
+    _state = None
 
-    if not get_destination_id(city,
-                              user_request):
-        bot.send_message(message.from_user.id,
-                         "Не получается найти такой город."
-                         "Проверьте правильность ввода, "
-                         "затем попробуйте ввести заново")
-        bot.register_next_step_handler(message,
-                                       get_city,
-                                       request_id)
-        return
+    def __init__(self, user_id: int, state: State) -> None:
+        self.change_state(state)
+        self.user_id = user_id
+        self.user_request = None
 
-    bot.send_message(message.from_user.id,
-                     "Сколько отелей показать? ")
-    bot.register_next_step_handler(message,
-                                   get_hotels_count,
-                                   user_request)
+    def change_state(self, state: Union[State, CallbackStateMixin]) -> None:
+        self._state = state
+        self._state.context = self
+
+    async def text_request(self, msg: tt.Message) -> None:
+        await self._state.message_handle(msg)
+
+    async def callback_request(self, call: tt.CallbackQuery) -> None:
+        await self._state.callback_handle(call)
 
 
-def get_hotels_count(message: telebot.types.Message, request_data: Model) -> None:
-    try:
-        count = int(message.text)
-        request_data.hotels_count = count
-        request_data.save()
-    except ValueError:
-        bot.send_message(message.from_user.id,
-                         'Укажите, пожалуйста, количество в числовом формате')
-        bot.register_next_step_handler(message,
-                                       get_hotels_count,
-                                       request_data)
-        return
+class State(ABC):
 
-    need_photos_keyboard = telebot.types.InlineKeyboardMarkup()
+    @property
+    def context(self) -> UserContext:
+        return self._context
 
-    key_yes = telebot.types.InlineKeyboardButton('Да',
-                                                 callback_data='yes')
-    need_photos_keyboard.add(key_yes)
-    key_no = telebot.types.InlineKeyboardButton('Нет',
-                                                callback_data='no')
-    need_photos_keyboard.add(key_no)
+    @context.setter
+    def context(self, context: UserContext) -> None:
+        self._context = context
 
-    bot.send_message(message.from_user.id,
-                     text='Показать фотографии отелей? ',
-                     reply_markup=need_photos_keyboard)
+    @abstractmethod
+    async def message_handle(self, msg: tt.Message) -> None:
+        pass
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def does_need_photos(call: telebot.types.CallbackQuery) -> None:
-    user_request = UserRequest.select()\
-        .where(UserRequest.user_id == call.message.chat.id)\
-        .order_by(UserRequest.id.desc())\
-        .get_or_none()
+class CallbackStateMixin(ABC):
 
-    if call.data == 'yes':
-        bot.send_message(call.message.chat.id,
-                         'Сколько показать фотографий?\n(не более 4-х)')
-        bot.register_next_step_handler(call.message,
-                                       get_photos_count, user_request)
-    elif call.data == 'no':
-        bot.send_message(call.message.chat.id,
-                         'Минутку')
-        get_hotels_info(call.message.chat.id, user_request)
+    @abstractmethod
+    async def callback_handle(self, call: tt.CallbackQuery) -> None:
+        pass
 
 
-def get_photos_count(message: telebot.types.Message, request_data: peewee.Model) -> None:
+class StartState(State):
 
-    photos_count = int(message.text)
+    async def message_handle(self, msg: tt.Message) -> None:
+        text = msg.text
 
-    if 1 > photos_count > 4:
-        bot.send_message(message.from_user.id,
-                         'Укажите, пожалуйста, число от 1 до 4')
-        bot.register_next_step_handler(message,
-                                       get_photos_count)
-        return
+        if text.lower() in ("/hello-world", "привет", "/help", "help"):
+            response = "Привет. " \
+                       "\nЭтот телеграмм-бот поможет найти подходящие отели в любом городе мира." \
+                       "\n\nКоманды бота:" \
+                       "\n/lowprice: самые дешёвые отели в выбранном городе" \
+                       "\n/highprice: самые дорогие отели" \
+                       "\n/bestdeal: отели в заданном ценовом диапазоне, " \
+                       "находящиеся от центра города не далее заданного расстояния" \
+                       "\n/history: история запросов"
+            await bot.send_message(msg.from_user.id, response)
 
-    request_data.photos_count = photos_count
-    request_data.save()
-    bot.send_message(message.from_user.id,
-                     'Минутку')
+        elif text in ("/lowprice", "/highprice", "/bestdeal"):
+            today = datetime.datetime.now()
+            check_in = (today + datetime.timedelta(1)).date()
+            check_out = (today + datetime.timedelta(2)).date()
+            with db:
+                user_request = UserRequest(user_id=msg.from_user.id,
+                                           command=text,
+                                           request_dt=datetime.datetime.now(),
+                                           check_in=check_in,
+                                           check_out=check_out)
+                user_request.save()
+                self.context.user_request = user_request
+            await bot.send_message(msg.from_user.id, "Введите город: ")
+            self.context.change_state(GetCityState())
 
-    get_hotels_info(message.chat.id, request_data)
+        else:
+            await bot.send_message(msg.from_user.id,
+                                   'Извините, но такую команду бот не поддерживает. '
+                                   'Воспользуйтесь командой /help или введите '
+                                   '"Привет" для получения информации о боте.')
+
+
+class GetCityState(State):
+
+    async def message_handle(self, msg: tt.Message) -> None:
+        with db:
+            user_request = self.context.user_request
+            city = msg.text
+            user_request.city = city
+            user_request.save()
+
+        if not await get_destination_id(city,
+                                        user_request):
+            await bot.send_message(msg.from_user.id,
+                                   "Не получается найти такой город."
+                                   "Проверьте правильность ввода, "
+                                   "затем попробуйте ввести заново")
+            return
+
+        await bot.send_message(msg.from_user.id,
+                               "Сколько отелей показать? (не более 25)")
+        self.context.change_state(HotelsCountState())
+
+
+class HotelsCountState(State):
+
+    async def message_handle(self, msg: tt.Message) -> None:
+        if msg.text.isdigit() and 0 < int(msg.text) <= 25:
+            count = int(msg.text)
+            with db:
+                request_data = self.context.user_request
+                request_data.hotels_count = count
+                request_data.save()
+        else:
+            await bot.send_message(msg.from_user.id,
+                                   "Укажите, пожалуйста, число от 1 до 25")
+            return
+
+        need_photos_keyboard = tt.InlineKeyboardMarkup()
+
+        key_yes = tt.InlineKeyboardButton("Да",
+                                          callback_data="yes")
+        need_photos_keyboard.add(key_yes)
+        key_no = tt.InlineKeyboardButton("Нет",
+                                         callback_data="no")
+        need_photos_keyboard.add(key_no)
+        await bot.send_message(msg.from_user.id,
+                               text="Показать фотографии отелей? ",
+                               reply_markup=need_photos_keyboard)
+        self.context.change_state(NeedPhotoState())
+
+
+class NeedPhotoState(State, CallbackStateMixin):
+
+    async def message_handle(self, msg: tt.Message) -> None:
+        pass
+
+    async def callback_handle(self, call: tt.CallbackQuery) -> None:
+        user_request = self.context.user_request
+
+        if call.data == "yes":
+            await bot.send_message(call.message.chat.id,
+                                   "Сколько показать фотографий?\n(не более 4-х)")
+            self.context.change_state(PhotosCountState())
+        elif call.data == "no":
+            await bot.send_message(call.message.chat.id,
+                                   "Минутку")
+            await get_hotels_info(call.message.chat.id, user_request)
+            self.context.change_state(StartState())
+
+
+class PhotosCountState(State):
+
+    async def message_handle(self, msg: tt.Message) -> None:
+        if not msg.text.isdigit() or not 0 < int(msg.text) < 5:
+            await bot.send_message(msg.from_user.id,
+                                   "Укажите, пожалуйста, число от 1 до 4")
+            return
+
+        with db:
+            request_data = self.context.user_request
+            request_data.photos_count = int(msg.text)
+            request_data.save()
+
+        await bot.send_message(msg.from_user.id,
+                               "Минутку")
+        self.context.change_state(StartState())
+        await get_hotels_info(msg.chat.id, request_data)
